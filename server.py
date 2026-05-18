@@ -746,13 +746,89 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     return await handle_tool(name, arguments)
 
 
-async def main():
+async def _main_stdio():
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-if __name__ == "__main__":
+def _run_stdio():
     import asyncio
+    asyncio.run(_main_stdio())
+
+
+def _run_http():
+    """
+    Sirve el MCP por HTTP usando el transporte 'streamable-http' del SDK oficial.
+    Compatible con los Custom Connectors de Claude.ai.
+
+    Variables de entorno relevantes:
+      PORT            puerto HTTP (por defecto 8000)
+      MCP_AUTH_TOKEN  si se define, se exige header `Authorization: Bearer <token>` en /mcp
+    """
+    import contextlib
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.responses import JSONResponse
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    auth_token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        event_store=None,
+        json_response=False,
+        stateless=True,
+    )
+
+    async def health(_request):
+        return JSONResponse({"status": "ok"})
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            yield
+
+    import starlette.types as st_types
+
+    class MCPEndpoint:
+        """ASGI app que aplica auth y delega al StreamableHTTPSessionManager.
+        Starlette detecta que esto es una clase (no una función) y la trata
+        como ASGI directo, sin envolverla en request/response — necesario
+        para que el streaming SSE del manager funcione."""
+
+        async def __call__(self, scope: st_types.Scope, receive: st_types.Receive, send: st_types.Send) -> None:
+            if auth_token:
+                headers = dict(scope.get("headers") or [])
+                provided = headers.get(b"authorization", b"").decode()
+                if provided != f"Bearer {auth_token}":
+                    response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                    await response(scope, receive, send)
+                    return
+            await session_manager.handle_request(scope, receive, send)
+
+    mcp_endpoint = MCPEndpoint()
+
+    app = Starlette(
+        debug=False,
+        routes=[
+            Route("/mcp", mcp_endpoint, methods=["GET", "POST", "DELETE"]),
+            Route("/mcp/", mcp_endpoint, methods=["GET", "POST", "DELETE"]),
+            Route("/health", health, methods=["GET"]),
+        ],
+        lifespan=lifespan,
+    )
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
+if __name__ == "__main__":
     if not EMAIL or not PASSWORD:
         raise SystemExit("ERROR: Define GARMIN_EMAIL y GARMIN_PASSWORD como variables de entorno.")
-    asyncio.run(main())
+
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+    if transport == "http":
+        _run_http()
+    else:
+        _run_stdio()
