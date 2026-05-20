@@ -65,6 +65,150 @@ def err(e: Exception) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
 
 
+def _date_range(start: str, end: str) -> list[str]:
+    s, e = date.fromisoformat(start), date.fromisoformat(end)
+    if e < s:
+        s, e = e, s
+    return [(s + timedelta(days=i)).isoformat() for i in range((e - s).days + 1)]
+
+
+def collect_range(fn, start: str, end: str) -> list:
+    """Itera un metodo de un solo dia sobre un rango y arma una lista por fecha."""
+    out = []
+    for day in _date_range(start, end):
+        try:
+            out.append({"date": day, "data": fn(day)})
+        except Exception as ex:
+            out.append({"date": day, "error": str(ex)})
+    return out
+
+
+def _first_value(dct):
+    """Primer value de un dict (para mapas con clave dinamica como deviceId)."""
+    if isinstance(dct, dict) and dct:
+        return next(iter(dct.values()))
+    return None
+
+
+def athlete_snapshot(gc, d: str) -> dict:
+    """Check-in diario en UNA llamada. Cada seccion es independiente: si una
+    fuente falla, devuelve {'error': ...} sin tumbar el resto del snapshot."""
+    snap = {"date": d}
+
+    # training_readiness (+ recovery_time sale del mismo payload, ahorra 1 llamada)
+    try:
+        tr = gc.get_training_readiness(d)
+        tr0 = tr[0] if isinstance(tr, list) and tr else (tr if isinstance(tr, dict) else {})
+        snap["training_readiness"] = {"score": tr0.get("score"), "level": tr0.get("level"), "feedback": tr0.get("feedbackShort")}
+        snap["recovery_time"] = {"minutes": tr0.get("recoveryTime")}
+    except Exception as e:
+        snap["training_readiness"] = {"error": str(e)}
+        snap["recovery_time"] = {"error": str(e)}
+
+    # training_status (acute/chronic/ACWR embebidos en acuteTrainingLoadDTO)
+    try:
+        ts = gc.get_training_status(d)
+        latest = _first_value(((ts or {}).get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}) or {}
+        load = latest.get("acuteTrainingLoadDTO") or {}
+        snap["training_status"] = {
+            "status": latest.get("trainingStatus"),
+            "phrase": latest.get("trainingStatusFeedbackPhrase"),
+            "acute_load": load.get("dailyTrainingLoadAcute"),
+            "chronic_load": load.get("dailyTrainingLoadChronic"),
+            "acwr": load.get("dailyAcuteChronicWorkloadRatio"),
+            "acwr_status": load.get("acwrStatus"),
+        }
+    except Exception as e:
+        snap["training_status"] = {"error": str(e)}
+
+    # hrv_status
+    try:
+        hrv = (gc.get_hrv_data(d) or {}).get("hrvSummary") or {}
+        snap["hrv_status"] = {"status": hrv.get("status"), "last_night_avg": hrv.get("lastNightAvg"), "weekly_avg": hrv.get("weeklyAvg")}
+    except Exception as e:
+        snap["hrv_status"] = {"error": str(e)}
+
+    # rhr
+    try:
+        rhr = gc.get_rhr_day(d)
+        vals = (((rhr or {}).get("allMetrics") or {}).get("metricsMap") or {}).get("WELLNESS_RESTING_HEART_RATE") or []
+        snap["rhr"] = {"bpm": (vals[0].get("value") if vals else None)}
+    except Exception as e:
+        snap["rhr"] = {"error": str(e)}
+
+    # body_battery
+    try:
+        bb = gc.get_body_battery(d, d)
+        bb0 = bb[0] if isinstance(bb, list) and bb else {}
+        levels = [p[1] for p in (bb0.get("bodyBatteryValuesArray") or []) if isinstance(p, list) and len(p) > 1 and p[1] is not None]
+        snap["body_battery"] = {
+            "charged": bb0.get("charged"), "drained": bb0.get("drained"),
+            "current": (levels[-1] if levels else None), "high": (max(levels) if levels else None), "low": (min(levels) if levels else None),
+        }
+    except Exception as e:
+        snap["body_battery"] = {"error": str(e)}
+
+    # last_activity
+    try:
+        la = gc.get_last_activity() or {}
+        snap["last_activity"] = {
+            "type": (la.get("activityType") or {}).get("typeKey"),
+            "name": la.get("activityName"), "start": la.get("startTimeLocal"),
+            "distance_km": (round(la["distance"] / 1000, 2) if la.get("distance") else None),
+            "duration_min": (round(la["duration"] / 60, 1) if la.get("duration") else None),
+            "avg_hr": la.get("averageHR"), "max_hr": la.get("maxHR"),
+        }
+    except Exception as e:
+        snap["last_activity"] = {"error": str(e)}
+
+    return snap
+
+
+def _months_between(start: str, end: str) -> list[tuple]:
+    s, e = date.fromisoformat(start), date.fromisoformat(end)
+    if e < s:
+        s, e = e, s
+    out, y, m = [], s.year, s.month
+    while (y, m) <= (e.year, e.month):
+        out.append((y, m))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def scheduled_workouts(gc, start: str, end: str) -> list:
+    """Workouts programados en el calendario de Garmin entre start y end (YYYY-MM-DD).
+    Itera por mes (la API es por year/month) y mapea a un schema plano. `completed`
+    es best-effort: True si hubo alguna actividad registrada ese dia. Las activities
+    del calendario no exponen el deporte de forma fiable (sportTypeKey viene null),
+    asi que el match es solo por fecha; sin llamadas extra."""
+    items = []
+    for (y, m) in _months_between(start, end):
+        try:
+            items.extend((gc.get_scheduled_workouts(y, m) or {}).get("calendarItems") or [])
+        except Exception:
+            pass
+    activity_dates = {it.get("date") for it in items if it.get("itemType") == "activity" and it.get("date")}
+    out, seen = [], set()
+    for it in items:
+        if it.get("itemType") != "workout":
+            continue
+        d = it.get("date")
+        if not d or not (start <= d <= end) or it.get("id") in seen:
+            continue
+        seen.add(it.get("id"))
+        out.append({
+            "scheduled_workout_id": it.get("id"),
+            "workout_id": it.get("workoutId"),
+            "workout_name": it.get("title"),
+            "date": d,
+            "sport_type": it.get("sportTypeKey"),
+            "estimated_duration_secs": it.get("duration"),
+            "completed": d in activity_dates,
+        })
+    out.sort(key=lambda w: (w["date"], w["scheduled_workout_id"] or 0))
+    return out
+
+
 # ─── Definición de herramientas ───────────────────────────────────────────────
 
 TOOLS: list[Tool] = [
@@ -93,7 +237,10 @@ TOOLS: list[Tool] = [
     # ── 4. MÉTRICAS AVANZADAS ─────────────────────────────────────────────────
     Tool(name="get_hrv_data", description="Variabilidad de FC (HRV) nocturna: estado, valores, tendencia de 5 días.", inputSchema={"type": "object", "properties": {"date": {"type": "string"}}}),
     Tool(name="get_training_readiness", description="Training Readiness (0-100): combinación de sueño, recuperación, carga y HRV.", inputSchema={"type": "object", "properties": {"date": {"type": "string"}}}),
-    Tool(name="get_training_status", description="Training Status: productivo, manteniendo, desentrenando, sobrecargado, etc.", inputSchema={"type": "object", "properties": {"use_cache": {"type": "boolean", "default": True}}}),
+    Tool(name="get_training_status", description="Training Status (productivo, manteniendo, desentrenando, sobrecargado, etc.). Incluye Acute/Chronic Load y ACWR en mostRecentTrainingStatus.latestTrainingStatusData.<userId>.acuteTrainingLoadDTO.", inputSchema={"type": "object", "properties": {"date": {"type": "string", "description": "Fecha YYYY-MM-DD (default: hoy)"}}}),
+    Tool(name="get_morning_training_readiness", description="Training Readiness matutino detallado: nivel, score y factores (sueño, recovery time, ACWR, HRV, stress) con su feedback.", inputSchema={"type": "object", "properties": {"date": {"type": "string", "description": "Fecha YYYY-MM-DD (default: hoy)"}}}),
+    Tool(name="get_running_tolerance", description="Running Tolerance: tolerancia/carga de carrera en un rango de fechas, agregada por semana o dia.", inputSchema={"type": "object", "properties": {"start_date": {"type": "string"}, "end_date": {"type": "string"}, "aggregation": {"type": "string", "description": "weekly (default) o daily"}}}),
+    Tool(name="get_athlete_snapshot", description="Check-in diario en UNA sola llamada: training_readiness, training_status (con ACWR y acute/chronic load), recovery_time, hrv_status, rhr, body_battery y last_activity. Reemplaza ~7 llamadas del workflow diario.", inputSchema={"type": "object", "properties": {"date": {"type": "string", "description": "Fecha YYYY-MM-DD (default: hoy)"}}}),
     Tool(name="get_vo2max", description="Estimación de VO2 Max para carrera y ciclismo.", inputSchema={"type": "object", "properties": {"date": {"type": "string"}}}),
     Tool(name="get_lactate_threshold", description="Umbral de lactato: FC y ritmo al umbral.", inputSchema={"type": "object", "properties": {}}),
     Tool(name="get_race_predictions", description="Predicciones de tiempo en carrera: 5K, 10K, media maratón, maratón.", inputSchema={"type": "object", "properties": {}}),
@@ -122,7 +269,7 @@ TOOLS: list[Tool] = [
     Tool(name="get_activity_splits", description="Splits por km/milla de una actividad.", inputSchema={"type": "object", "properties": {"activity_id": {"type": "integer"}}, "required": ["activity_id"]}),
     Tool(name="get_activity_weather", description="Condiciones climáticas durante una actividad.", inputSchema={"type": "object", "properties": {"activity_id": {"type": "integer"}}, "required": ["activity_id"]}),
     Tool(name="get_activity_exercise_sets", description="Series de ejercicio de una sesión de fuerza: repeticiones, peso, duración.", inputSchema={"type": "object", "properties": {"activity_id": {"type": "integer"}}, "required": ["activity_id"]}),
-    Tool(name="get_progress_summary", description="Resumen de progreso en un rango de fechas por tipo de actividad.", inputSchema={"type": "object", "properties": {"start_date": {"type": "string"}, "end_date": {"type": "string"}, "activity_type": {"type": "string", "default": "running"}}, "required": ["start_date", "end_date"]}),
+    Tool(name="get_progress_summary", description="Resumen de progreso en un rango de fechas. metric: distance (default), duration, elevationGain, etc.", inputSchema={"type": "object", "properties": {"start_date": {"type": "string"}, "end_date": {"type": "string"}, "metric": {"type": "string", "default": "distance"}}, "required": ["start_date", "end_date"]}),
 
     # ── 7. ENTRENAMIENTOS (CREAR / PROGRAMAR / ELIMINAR) ─────────────────────
     Tool(
@@ -160,7 +307,7 @@ TOOLS: list[Tool] = [
                             "secondary_target_value_high": {"type": "number"},
                             "secondary_zone_number": {"type": "integer"},
                             "stroke_type": {"type": "string", "description": "Natación: free, back, breast, fly, medley, any"},
-                            "equipment_type": {"type": "string", "description": "Natación: none, kickboard, fins, paddles, buoy"},
+                            "equipment_type": {"type": "string", "description": "Natación: none, fins, kickboard, paddles, buoy (pull_buoy), snorkel"},
                             "drill_type": {"type": "string", "description": "Natación: kick, pull, drill"},
                             "category":      {"type": "string", "description": "Fuerza: PULL_UP, SQUAT, DEADLIFT, BENCH_PRESS, CARDIO, etc."},
                             "exercise_name": {"type": "string", "description": "Fuerza: WEIGHTED_PULL_UP, WEIGHTED_SQUAT, DEADLIFT, etc."},
@@ -201,11 +348,17 @@ TOOLS: list[Tool] = [
         }
     ),
     Tool(
+        name="unschedule_workout",
+        description="Quita un entrenamiento programado del calendario. Usa el scheduled_workout_id (de get_scheduled_workouts o de la respuesta de schedule_workout), NO el workout_id.",
+        inputSchema={"type": "object", "properties": {"scheduled_workout_id": {"type": "integer", "description": "ID de la programacion, no el del workout"}}, "required": ["scheduled_workout_id"]}
+    ),
+    Tool(
         name="delete_workout",
         description="Elimina un entrenamiento de Garmin Connect.",
         inputSchema={"type": "object", "properties": {"workout_id": {"type": "integer"}}, "required": ["workout_id"]}
     ),
     Tool(name="get_workouts", description="Lista todos los entrenamientos guardados en Garmin Connect.", inputSchema={"type": "object", "properties": {"start": {"type": "integer", "default": 0}, "limit": {"type": "integer", "default": 20}}}),
+    Tool(name="get_scheduled_workouts", description="Workouts programados en el calendario entre start_date y end_date (YYYY-MM-DD). Devuelve por cada uno: scheduled_workout_id (el que pide unschedule_workout), workout_id, workout_name, date, sport_type, estimated_duration_secs y completed (best-effort).", inputSchema={"type": "object", "properties": {"start_date": {"type": "string"}, "end_date": {"type": "string"}}, "required": ["start_date", "end_date"]}),
     Tool(name="get_workout", description="Obtiene los detalles de un entrenamiento específico.", inputSchema={"type": "object", "properties": {"workout_id": {"type": "integer"}}, "required": ["workout_id"]}),
 
     # ── 8. COMPOSICIÓN CORPORAL Y PESO ────────────────────────────────────────
@@ -323,7 +476,7 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
         if name == "get_heart_rates":
             return ok(gc.get_heart_rates(d))
         if name == "get_resting_heart_rate":
-            return ok(gc.get_resting_heart_rate(d))
+            return ok(gc.get_rhr_day(d))
         if name == "get_stress_data":
             return ok(gc.get_stress_data(d))
         if name == "get_body_battery":
@@ -347,7 +500,13 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
         if name == "get_training_readiness":
             return ok(gc.get_training_readiness(d))
         if name == "get_training_status":
-            return ok(gc.get_training_status(args.get("use_cache", True)))
+            return ok(gc.get_training_status(d))
+        if name == "get_morning_training_readiness":
+            return ok(gc.get_morning_training_readiness(d))
+        if name == "get_running_tolerance":
+            return ok(gc.get_running_tolerance(sd, ed, args.get("aggregation", "weekly")))
+        if name == "get_athlete_snapshot":
+            return ok(athlete_snapshot(gc, d))
         if name == "get_vo2max":
             return ok(gc.get_max_metrics(d))
         if name == "get_lactate_threshold":
@@ -373,13 +532,13 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
         if name == "get_weekly_intensity_minutes":
             return ok(gc.get_weekly_intensity_minutes(sd, ed))
         if name == "get_heart_rate_range":
-            return ok(gc.get_resting_heart_rate(d))
+            return ok(collect_range(gc.get_rhr_day, sd, ed))
         if name == "get_hrv_range":
-            return ok(gc.get_hrv_data(sd))
+            return ok(collect_range(gc.get_hrv_data, sd, ed))
         if name == "get_sleep_data_range":
-            return ok(gc.get_sleep_data(sd))
+            return ok(collect_range(gc.get_sleep_data, sd, ed))
         if name == "get_stress_range":
-            return ok(gc.get_stress_data(sd))
+            return ok(collect_range(gc.get_stress_data, sd, ed))
         if name == "get_body_battery_range":
             return ok(gc.get_body_battery(sd, ed))
 
@@ -393,7 +552,7 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
         if name == "get_activity_details":
             return ok(gc.get_activity_details(args["activity_id"]))
         if name == "get_activity_hr_zones":
-            return ok(gc.get_activity_hr_zones(args["activity_id"]))
+            return ok(gc.get_activity_hr_in_timezones(args["activity_id"]))
         if name == "get_activity_splits":
             return ok(gc.get_activity_splits(args["activity_id"]))
         if name == "get_activity_weather":
@@ -401,7 +560,7 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
         if name == "get_activity_exercise_sets":
             return ok(gc.get_activity_exercise_sets(args["activity_id"]))
         if name == "get_progress_summary":
-            return ok(gc.get_progress_summary(sd, ed, args.get("activity_type", "running")))
+            return ok(gc.get_progress_summary_between_dates(sd, ed, args.get("metric", "distance")))
 
         # ── ENTRENAMIENTOS ────────────────────────────────────────────────────
         if name == "get_workouts":
@@ -412,6 +571,10 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
             return ok(gc.delete_workout(args["workout_id"]))
         if name == "schedule_workout":
             return ok(gc.schedule_workout(args["workout_id"], args["scheduled_date"]))
+        if name == "unschedule_workout":
+            return ok(gc.unschedule_workout(args["scheduled_workout_id"]))
+        if name == "get_scheduled_workouts":
+            return ok(scheduled_workouts(gc, sd, ed))
 
         if name == "add_workout":
             # ── Mapas verificados con payloads reales de Garmin Connect ──────────
@@ -460,12 +623,15 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
                 "fly":        {"strokeTypeId": 5, "strokeTypeKey": "fly",        "displayOrder": 5},
                 "free":       {"strokeTypeId": 6, "strokeTypeKey": "free",       "displayOrder": 6},
             }
+            # IDs reales de Garmin (/workout-service/workout/types -> workoutEquipmentTypes)
             EQUIPMENT_MAP = {
                 "none":      {"equipmentTypeId": 0, "equipmentTypeKey": None,        "displayOrder": 0},
+                "fins":      {"equipmentTypeId": 1, "equipmentTypeKey": "fins",      "displayOrder": 1},
                 "kickboard": {"equipmentTypeId": 2, "equipmentTypeKey": "kickboard", "displayOrder": 2},
-                "fins":      {"equipmentTypeId": 3, "equipmentTypeKey": "fins",      "displayOrder": 3},
-                "paddles":   {"equipmentTypeId": 4, "equipmentTypeKey": "paddles",   "displayOrder": 4},
-                "buoy":      {"equipmentTypeId": 5, "equipmentTypeKey": "buoy",      "displayOrder": 5},
+                "paddles":   {"equipmentTypeId": 3, "equipmentTypeKey": "paddles",   "displayOrder": 3},
+                "buoy":      {"equipmentTypeId": 4, "equipmentTypeKey": "pull_buoy", "displayOrder": 4},
+                "pull_buoy": {"equipmentTypeId": 4, "equipmentTypeKey": "pull_buoy", "displayOrder": 4},
+                "snorkel":   {"equipmentTypeId": 5, "equipmentTypeKey": "snorkel",   "displayOrder": 5},
             }
             DRILL_MAP = {
                 "kick":   {"drillTypeId": 1, "drillTypeKey": "kick",   "displayOrder": 1},
@@ -736,9 +902,39 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
 server = Server("garmin-python-mcp")
 
 
+# Conjunto "core": tools criticas del coaching diario + ciclo de workouts.
+# Quedan bajo el cap de tools por servidor del cliente, asi que estan SIEMPRE
+# disponibles (no dependen de la loteria del indice dinamico).
+CORE_TOOLS = {
+    "get_athlete_snapshot", "get_training_readiness", "get_training_status",
+    "get_morning_training_readiness", "get_hrv_data", "get_hrv_range",
+    "get_sleep_data", "get_sleep_data_range", "get_resting_heart_rate",
+    "get_stats", "get_body_battery",
+    "get_activities", "get_activities_by_date", "get_activity_details",
+    "get_activity_hr_zones", "get_progress_summary", "get_vo2max",
+    "add_workout", "schedule_workout", "unschedule_workout", "delete_workout",
+    "get_workouts", "get_workout", "get_scheduled_workouts", "search_strength_exercises",
+    "get_strength_exercises_by_muscle",
+}
+
+
+def select_tools() -> list[Tool]:
+    """Reparte el conector en 2 servers segun la env GARMIN_TOOLS, para que cada
+    uno quepa bajo el cap de tools del cliente:
+      core  -> solo CORE_TOOLS (coaching diario + workouts)  [~25, garantizadas]
+      extra -> el resto
+      (sin definir) -> todas (comportamiento por defecto, retrocompatible)"""
+    sel = os.environ.get("GARMIN_TOOLS", "").strip().lower()
+    if sel == "core":
+        return [t for t in TOOLS if t.name in CORE_TOOLS]
+    if sel == "extra":
+        return [t for t in TOOLS if t.name not in CORE_TOOLS]
+    return TOOLS
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return TOOLS
+    return select_tools()
 
 
 @server.call_tool()
@@ -746,13 +942,89 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     return await handle_tool(name, arguments)
 
 
-async def main():
+async def _main_stdio():
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-if __name__ == "__main__":
+def _run_stdio():
     import asyncio
+    asyncio.run(_main_stdio())
+
+
+def _run_http():
+    """
+    Sirve el MCP por HTTP usando el transporte 'streamable-http' del SDK oficial.
+    Compatible con los Custom Connectors de Claude.ai.
+
+    Variables de entorno relevantes:
+      PORT            puerto HTTP (por defecto 8000)
+      MCP_AUTH_TOKEN  si se define, se exige header `Authorization: Bearer <token>` en /mcp
+    """
+    import contextlib
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.responses import JSONResponse
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    auth_token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        event_store=None,
+        json_response=False,
+        stateless=True,
+    )
+
+    async def health(_request):
+        return JSONResponse({"status": "ok"})
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            yield
+
+    import starlette.types as st_types
+
+    class MCPEndpoint:
+        """ASGI app que aplica auth y delega al StreamableHTTPSessionManager.
+        Starlette detecta que esto es una clase (no una función) y la trata
+        como ASGI directo, sin envolverla en request/response — necesario
+        para que el streaming SSE del manager funcione."""
+
+        async def __call__(self, scope: st_types.Scope, receive: st_types.Receive, send: st_types.Send) -> None:
+            if auth_token:
+                headers = dict(scope.get("headers") or [])
+                provided = headers.get(b"authorization", b"").decode()
+                if provided != f"Bearer {auth_token}":
+                    response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                    await response(scope, receive, send)
+                    return
+            await session_manager.handle_request(scope, receive, send)
+
+    mcp_endpoint = MCPEndpoint()
+
+    app = Starlette(
+        debug=False,
+        routes=[
+            Route("/mcp", mcp_endpoint, methods=["GET", "POST", "DELETE"]),
+            Route("/mcp/", mcp_endpoint, methods=["GET", "POST", "DELETE"]),
+            Route("/health", health, methods=["GET"]),
+        ],
+        lifespan=lifespan,
+    )
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
+if __name__ == "__main__":
     if not EMAIL or not PASSWORD:
         raise SystemExit("ERROR: Define GARMIN_EMAIL y GARMIN_PASSWORD como variables de entorno.")
-    asyncio.run(main())
+
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+    if transport == "http":
+        _run_http()
+    else:
+        _run_stdio()
