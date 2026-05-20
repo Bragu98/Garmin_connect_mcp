@@ -854,9 +854,39 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
 server = Server("garmin-python-mcp")
 
 
+# Conjunto "core": tools criticas del coaching diario + ciclo de workouts.
+# Quedan bajo el cap de tools por servidor del cliente, asi que estan SIEMPRE
+# disponibles (no dependen de la loteria del indice dinamico).
+CORE_TOOLS = {
+    "get_athlete_snapshot", "get_training_readiness", "get_training_status",
+    "get_morning_training_readiness", "get_hrv_data", "get_hrv_range",
+    "get_sleep_data", "get_sleep_data_range", "get_resting_heart_rate",
+    "get_stats", "get_body_battery",
+    "get_activities", "get_activities_by_date", "get_activity_details",
+    "get_activity_hr_zones", "get_progress_summary", "get_vo2max",
+    "add_workout", "schedule_workout", "unschedule_workout", "delete_workout",
+    "get_workouts", "get_workout", "search_strength_exercises",
+    "get_strength_exercises_by_muscle",
+}
+
+
+def select_tools() -> list[Tool]:
+    """Reparte el conector en 2 servers segun la env GARMIN_TOOLS, para que cada
+    uno quepa bajo el cap de tools del cliente:
+      core  -> solo CORE_TOOLS (coaching diario + workouts)  [~25, garantizadas]
+      extra -> el resto
+      (sin definir) -> todas (comportamiento por defecto, retrocompatible)"""
+    sel = os.environ.get("GARMIN_TOOLS", "").strip().lower()
+    if sel == "core":
+        return [t for t in TOOLS if t.name in CORE_TOOLS]
+    if sel == "extra":
+        return [t for t in TOOLS if t.name not in CORE_TOOLS]
+    return TOOLS
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return TOOLS
+    return select_tools()
 
 
 @server.call_tool()
