@@ -65,6 +65,24 @@ def err(e: Exception) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
 
 
+def _date_range(start: str, end: str) -> list[str]:
+    s, e = date.fromisoformat(start), date.fromisoformat(end)
+    if e < s:
+        s, e = e, s
+    return [(s + timedelta(days=i)).isoformat() for i in range((e - s).days + 1)]
+
+
+def collect_range(fn, start: str, end: str) -> list:
+    """Itera un metodo de un solo dia sobre un rango y arma una lista por fecha."""
+    out = []
+    for day in _date_range(start, end):
+        try:
+            out.append({"date": day, "data": fn(day)})
+        except Exception as ex:
+            out.append({"date": day, "error": str(ex)})
+    return out
+
+
 # ─── Definición de herramientas ───────────────────────────────────────────────
 
 TOOLS: list[Tool] = [
@@ -323,7 +341,7 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
         if name == "get_heart_rates":
             return ok(gc.get_heart_rates(d))
         if name == "get_resting_heart_rate":
-            return ok(gc.get_resting_heart_rate(d))
+            return ok(gc.get_rhr_day(d))
         if name == "get_stress_data":
             return ok(gc.get_stress_data(d))
         if name == "get_body_battery":
@@ -373,13 +391,13 @@ async def handle_tool(name: str, args: dict) -> list[TextContent]:
         if name == "get_weekly_intensity_minutes":
             return ok(gc.get_weekly_intensity_minutes(sd, ed))
         if name == "get_heart_rate_range":
-            return ok(gc.get_resting_heart_rate(d))
+            return ok(collect_range(gc.get_rhr_day, sd, ed))
         if name == "get_hrv_range":
-            return ok(gc.get_hrv_data(sd))
+            return ok(collect_range(gc.get_hrv_data, sd, ed))
         if name == "get_sleep_data_range":
-            return ok(gc.get_sleep_data(sd))
+            return ok(collect_range(gc.get_sleep_data, sd, ed))
         if name == "get_stress_range":
-            return ok(gc.get_stress_data(sd))
+            return ok(collect_range(gc.get_stress_data, sd, ed))
         if name == "get_body_battery_range":
             return ok(gc.get_body_battery(sd, ed))
 
